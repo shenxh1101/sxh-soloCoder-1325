@@ -14,9 +14,10 @@ from PyQt6.QtGui import QAction
 
 from .audio_core import load_audio_file, AudioSignal, MicrophoneRecorder
 from .spectrum import (
-    WINDOW_TYPES, compute_fft, compute_psd_welch, detect_peaks, compute_thd
+    WINDOW_TYPES, compute_fft, compute_fft_fast, compute_spectrum_segmented,
+    compute_psd_welch, detect_peaks, compute_thd
 )
-from .filter_design import FilterDesign, FILTER_TYPE_NAMES
+from .filter_design import FilterDesign, FILTER_TYPE_NAMES, IIR_METHOD_NAMES, IIR_METHODS
 from .time_frequency import compute_stft, compute_spectrogram_simple, compute_cwt
 from .signal_synthesis import (
     SignalSynthesizer, SignalComponent, generate_sine, generate_square,
@@ -49,7 +50,7 @@ class MainWindow(QMainWindow):
         self.setGeometry(100, 100, 1400, 900)
         self.current_signal = None
         self.filtered_signal = None
-        self.recorder = MicrophoneRecorder()
+        self.recorder = MicrophoneRecorder(chunk_size=2048)
         self.recording_thread = None
         self.filter_design = FilterDesign()
         self.synthesizer = SignalSynthesizer()
@@ -58,6 +59,12 @@ class MainWindow(QMainWindow):
         self.current_peaks = []
         self.current_thd = None
         self.current_tf_data = None
+        self._live_spectrum_data = None
+        self._refresh_timer = QTimer()
+        self._refresh_timer.timeout.connect(self._on_refresh_timeout)
+        self._refresh_interval_ms = 100
+        self._live_preview_signal = None
+        self._is_recording_live = False
         self._init_ui()
         self._create_menu()
 
@@ -122,7 +129,7 @@ class MainWindow(QMainWindow):
         display_layout = QGridLayout(display_group)
         display_layout.addWidget(QLabel('通道模式:'), 0, 0)
         self.channel_mode_combo = QComboBox()
-        self.channel_mode_combo.addItems(['叠加显示', '独立查看'])
+        self.channel_mode_combo.addItems(['叠加显示', '分屏显示', '单通道'])
         self.channel_mode_combo.currentIndexChanged.connect(self.refresh_time_plot)
         display_layout.addWidget(self.channel_mode_combo, 0, 1)
         display_layout.addWidget(QLabel('选择通道:'), 1, 0)
@@ -132,6 +139,9 @@ class MainWindow(QMainWindow):
         self.normalize_check = QCheckBox('归一化显示')
         self.normalize_check.stateChanged.connect(self.refresh_time_plot)
         display_layout.addWidget(self.normalize_check, 2, 0, 1, 2)
+        self.live_update_check = QCheckBox('录音时实时更新')
+        self.live_update_check.setChecked(True)
+        display_layout.addWidget(self.live_update_check, 3, 0, 1, 2)
         control_layout.addWidget(display_group)
         info_group = QGroupBox('信号信息')
         info_layout = QGridLayout(info_group)
@@ -247,7 +257,7 @@ class MainWindow(QMainWindow):
         layout = QHBoxLayout(tab)
         control_panel = QWidget()
         control_layout = QVBoxLayout(control_panel)
-        control_panel.setFixedWidth(300)
+        control_panel.setFixedWidth(320)
         design_group = QGroupBox('滤波器设计')
         design_layout = QGridLayout(design_group)
         design_layout.addWidget(QLabel('类型:'), 0, 0)
@@ -255,41 +265,84 @@ class MainWindow(QMainWindow):
         for key, name in FILTER_TYPE_NAMES.items():
             self.filter_type_combo.addItem(name, key)
         self.filter_type_combo.currentIndexChanged.connect(self.on_filter_type_change)
+        self.filter_type_combo.currentIndexChanged.connect(lambda: self._on_filter_param_change(True))
         design_layout.addWidget(self.filter_type_combo, 0, 1)
         design_layout.addWidget(QLabel('方法:'), 1, 0)
         self.filter_method_combo = QComboBox()
         self.filter_method_combo.addItem('FIR (有限脉冲响应)', 'fir')
-        self.filter_method_combo.addItem('IIR (巴特沃斯)', 'iir')
+        self.filter_method_combo.addItem('IIR (无限脉冲响应)', 'iir')
+        self.filter_method_combo.currentIndexChanged.connect(self.on_filter_method_change)
+        self.filter_method_combo.currentIndexChanged.connect(lambda: self._on_filter_param_change(True))
         design_layout.addWidget(self.filter_method_combo, 1, 1)
-        design_layout.addWidget(QLabel('阶数:'), 2, 0)
+        self.iir_method_label = QLabel('IIR 子类型:')
+        design_layout.addWidget(self.iir_method_label, 2, 0)
+        self.iir_method_combo = QComboBox()
+        for key, name in IIR_METHOD_NAMES.items():
+            self.iir_method_combo.addItem(name, key)
+        self.iir_method_combo.currentIndexChanged.connect(self.on_iir_method_change)
+        self.iir_method_combo.currentIndexChanged.connect(lambda: self._on_filter_param_change(True))
+        design_layout.addWidget(self.iir_method_combo, 2, 1)
+        design_layout.addWidget(QLabel('阶数:'), 3, 0)
         self.filter_order_spin = QSpinBox()
         self.filter_order_spin.setRange(1, 500)
         self.filter_order_spin.setValue(51)
-        design_layout.addWidget(self.filter_order_spin, 2, 1)
-        design_layout.addWidget(QLabel('低截止(Hz):'), 3, 0)
+        self.filter_order_spin.valueChanged.connect(lambda: self._on_filter_param_change(True))
+        design_layout.addWidget(self.filter_order_spin, 3, 1)
+        design_layout.addWidget(QLabel('低截止(Hz):'), 4, 0)
         self.filter_low_spin = QDoubleSpinBox()
         self.filter_low_spin.setRange(1, 96000)
         self.filter_low_spin.setValue(1000)
         self.filter_low_spin.setSuffix(' Hz')
-        design_layout.addWidget(self.filter_low_spin, 3, 1)
+        self.filter_low_spin.valueChanged.connect(lambda: self._on_filter_param_change(True))
+        design_layout.addWidget(self.filter_low_spin, 4, 1)
         self.filter_high_label = QLabel('高截止(Hz):')
-        design_layout.addWidget(self.filter_high_label, 4, 0)
+        design_layout.addWidget(self.filter_high_label, 5, 0)
         self.filter_high_spin = QDoubleSpinBox()
         self.filter_high_spin.setRange(1, 96000)
         self.filter_high_spin.setValue(4000)
         self.filter_high_spin.setSuffix(' Hz')
-        design_layout.addWidget(self.filter_high_spin, 4, 1)
-        design_layout.addWidget(QLabel('窗口(仅FIR):'), 5, 0)
+        self.filter_high_spin.valueChanged.connect(lambda: self._on_filter_param_change(True))
+        design_layout.addWidget(self.filter_high_spin, 5, 1)
+        self.passband_ripple_label = QLabel('通带纹波(dB):')
+        design_layout.addWidget(self.passband_ripple_label, 6, 0)
+        self.passband_ripple_spin = QDoubleSpinBox()
+        self.passband_ripple_spin.setRange(0.01, 30)
+        self.passband_ripple_spin.setValue(1.0)
+        self.passband_ripple_spin.setSingleStep(0.1)
+        self.passband_ripple_spin.valueChanged.connect(lambda: self._on_filter_param_change(True))
+        design_layout.addWidget(self.passband_ripple_spin, 6, 1)
+        self.stopband_atten_label = QLabel('阻带衰减(dB):')
+        design_layout.addWidget(self.stopband_atten_label, 7, 0)
+        self.stopband_atten_spin = QDoubleSpinBox()
+        self.stopband_atten_spin.setRange(1, 200)
+        self.stopband_atten_spin.setValue(60.0)
+        self.stopband_atten_spin.setSingleStep(1)
+        self.stopband_atten_spin.valueChanged.connect(lambda: self._on_filter_param_change(True))
+        design_layout.addWidget(self.stopband_atten_spin, 7, 1)
+        design_layout.addWidget(QLabel('窗口(仅FIR):'), 8, 0)
         self.filter_window_combo = QComboBox()
         for key, name in WINDOW_TYPES.items():
             self.filter_window_combo.addItem(name, key)
-        design_layout.addWidget(self.filter_window_combo, 5, 1)
+        self.filter_window_combo.currentIndexChanged.connect(self.on_filter_window_change)
+        self.filter_window_combo.currentIndexChanged.connect(lambda: self._on_filter_param_change(True))
+        design_layout.addWidget(self.filter_window_combo, 8, 1)
+        self.kaiser_beta_label = QLabel('凯泽窗 β:')
+        design_layout.addWidget(self.kaiser_beta_label, 9, 0)
+        self.kaiser_beta_spin = QDoubleSpinBox()
+        self.kaiser_beta_spin.setRange(0, 30)
+        self.kaiser_beta_spin.setValue(14.0)
+        self.kaiser_beta_spin.setSingleStep(0.5)
+        self.kaiser_beta_spin.valueChanged.connect(lambda: self._on_filter_param_change(True))
+        design_layout.addWidget(self.kaiser_beta_spin, 9, 1)
+        self.auto_preview_check = QCheckBox('参数改变时自动预览响应')
+        self.auto_preview_check.setChecked(True)
+        design_layout.addWidget(self.auto_preview_check, 10, 0, 1, 2)
         preview_btn = QPushButton('预览滤波器响应')
         preview_btn.clicked.connect(self.preview_filter_response)
-        design_layout.addWidget(preview_btn, 6, 0, 1, 2)
+        design_layout.addWidget(preview_btn, 11, 0, 1, 2)
         apply_filter_btn = QPushButton('应用滤波到信号')
         apply_filter_btn.clicked.connect(self.apply_filter)
-        design_layout.addWidget(apply_filter_btn, 7, 0, 1, 2)
+        design_layout.addWidget(apply_filter_btn, 12, 0, 1, 2)
         control_layout.addWidget(design_group)
         result_group = QGroupBox('结果')
         result_layout = QVBoxLayout(result_group)
@@ -315,6 +368,8 @@ class MainWindow(QMainWindow):
         layout.addWidget(splitter)
         self.tabs.addTab(tab, '滤波器设计')
         self.on_filter_type_change()
+        self.on_filter_method_change(0)
+        self.on_iir_method_change(0)
 
     def _create_time_frequency_tab(self):
         tab = QWidget()
@@ -519,7 +574,22 @@ class MainWindow(QMainWindow):
         self.info_dur.setText(f'{signal.duration:.3f} s')
         self.filter_design.sample_rate = signal.sample_rate
         self.synth_sr_spin.setValue(signal.sample_rate)
+        n_samples = signal.get_n_samples()
+        if n_samples > 2000000:
+            self.statusBar.showMessage(
+                f'已加载大文件: {n_samples/1e6:.1f}M 采样点, {signal.duration/60:.1f} 分钟, '
+                f'显示时已自动降采样优化'
+            )
         self.refresh_time_plot()
+
+    def closeEvent(self, event):
+        if self.recorder.is_recording():
+            try:
+                self._refresh_timer.stop()
+                self.recorder.stop_recording()
+            except Exception:
+                pass
+        event.accept()
 
     def get_active_signal(self):
         if self.use_filtered_check.isChecked() and self.filtered_signal is not None:
@@ -529,24 +599,102 @@ class MainWindow(QMainWindow):
     def toggle_recording(self):
         if not self.recorder.is_recording():
             try:
+                self._live_preview_signal = AudioSignal(
+                    sample_rate=self.recorder.sample_rate,
+                    name="Recording_Live"
+                )
                 self.recorder.start_recording()
+                self._is_recording_live = True
                 self.record_btn.setText('停止录音')
                 self.record_action.setText('停止录音')
                 self.statusBar.showMessage('正在录音...')
+                self._refresh_timer.start(self._refresh_interval_ms)
             except Exception as e:
                 QMessageBox.critical(self, '错误', f'启动录音失败:\n{str(e)}')
         else:
             try:
+                self._refresh_timer.stop()
+                self._is_recording_live = False
                 signal = self.recorder.stop_recording()
                 self.record_btn.setText('开始录音')
                 self.record_action.setText('开始录音')
                 if signal is not None:
                     self._load_signal(signal)
-                    self.statusBar.showMessage('录音完成')
+                    self.statusBar.showMessage(
+                        f'录音完成: {signal.duration:.1f}s, {signal.channels}通道, {signal.sample_rate}Hz'
+                    )
                 else:
                     self.statusBar.showMessage('录音失败')
             except Exception as e:
                 QMessageBox.critical(self, '错误', f'停止录音失败:\n{str(e)}')
+
+    def _on_refresh_timeout(self):
+        if not self.recorder.is_recording() or not self.live_update_check.isChecked():
+            return
+        if not self.recorder.has_new_data():
+            return
+        preview = self.recorder.get_current_preview(max_seconds=5.0)
+        if preview is None:
+            return
+        current_tab = self.tabs.currentIndex()
+        if current_tab == 0:
+            self._update_live_time_plot(preview)
+        elif current_tab == 1:
+            self._update_live_spectrum(preview)
+        self.statusBar.showMessage(f'正在录音... 已录制 {self._get_recorded_duration():.1f}s')
+
+    def _get_recorded_duration(self):
+        try:
+            if self.recorder._chunk_lock:
+                with self.recorder._chunk_lock:
+                    chunks = list(self.recorder._buffer)
+            else:
+                chunks = list(self.recorder._buffer)
+            if len(chunks) == 0:
+                return 0.0
+            total_samples = sum(len(c) for c in chunks)
+            return total_samples / self.recorder.sample_rate
+        except Exception:
+            return 0.0
+
+    def _update_live_time_plot(self, preview_signal):
+        mode_idx = self.channel_mode_combo.currentIndex()
+        if mode_idx == 0:
+            display_mode = 'overlay'
+        elif mode_idx == 1:
+            display_mode = 'stacked'
+        else:
+            display_mode = 'single'
+        self.time_plot.set_display_mode(display_mode)
+        if self.time_plot.display_mode == 'single':
+            ch_idx = self.channel_combo.currentIndex()
+            if ch_idx >= 0 and ch_idx < preview_signal.channels:
+                self.time_plot.update_data_incremental(preview_signal, channels=[ch_idx])
+        else:
+            self.time_plot.update_data_incremental(preview_signal)
+
+    def _update_live_spectrum(self, preview_signal):
+        ch_data = preview_signal.get_channel(0)
+        if ch_data is None or len(ch_data) < 256:
+            return
+        window_key = self.window_combo.currentData()
+        freqs, mag_db, phase, psd_db = compute_fft_fast(
+            ch_data, preview_signal.sample_rate, window_name=window_key, n_fft=2048
+        )
+        if freqs is None:
+            return
+        self._live_spectrum_data = {
+            'freqs': freqs, 'magnitude_db': mag_db,
+            'phase': phase, 'psd_db': psd_db
+        }
+        d = self._live_spectrum_data
+        log = self.log_freq_check.isChecked()
+        modes = ['magnitude', 'phase', 'psd', 'all']
+        current_mode = modes[self.spec_mode_combo.currentIndex()]
+        self.spectrum_plot.set_mode(current_mode)
+        self.spectrum_plot.plot_spectrum(
+            d['freqs'], d['magnitude_db'], d['phase'], d['psd_db'], log_scale=log
+        )
 
     def on_time_selection(self, xmin, xmax):
         if self.current_signal is None:
@@ -585,12 +733,24 @@ class MainWindow(QMainWindow):
         if self.normalize_check.isChecked():
             from .audio_core import normalize_signal
             display_signal = normalize_signal(signal)
-        if self.channel_mode_combo.currentIndex() == 0:
-            self.time_plot.plot_signal(display_signal, overlay=False)
+        mode_idx = self.channel_mode_combo.currentIndex()
+        if mode_idx == 0:
+            display_mode = 'overlay'
+            channels = None
+        elif mode_idx == 1:
+            display_mode = 'stacked'
+            channels = None
         else:
+            display_mode = 'single'
             ch_idx = self.channel_combo.currentIndex()
-            if ch_idx >= 0 and ch_idx < signal.channels:
-                self.time_plot.plot_signal(display_signal, channels=[ch_idx])
+            if ch_idx < 0 or ch_idx >= signal.channels:
+                ch_idx = 0
+            channels = [ch_idx]
+        self.time_plot.plot_signal(
+            display_signal, channels=channels,
+            overlay=(display_mode == 'overlay' and signal.channels > 1),
+            display_mode=display_mode
+        )
 
     def on_spec_mode_change(self, idx):
         modes = ['magnitude', 'phase', 'psd', 'all']
@@ -610,9 +770,18 @@ class MainWindow(QMainWindow):
             n_fft = None
         else:
             n_fft = int(size_text)
-        freqs, mag_db, phase, psd_db = compute_fft(
-            ch_data, signal.sample_rate, window_name=window_key, n_fft=n_fft
-        )
+        n_samples = len(ch_data)
+        if n_samples > 5000000:
+            self.statusBar.showMessage('正在计算大文件频谱（分段平均）...')
+            nperseg = n_fft if n_fft else 8192
+            freqs, mag_db, phase, psd_db = compute_spectrum_segmented(
+                ch_data, signal.sample_rate, window_name=window_key,
+                nperseg=nperseg, max_segments=50
+            )
+        else:
+            freqs, mag_db, phase, psd_db = compute_fft(
+                ch_data, signal.sample_rate, window_name=window_key, n_fft=n_fft
+            )
         self.current_spectrum_data = {
             'freqs': freqs, 'magnitude_db': mag_db,
             'phase': phase, 'psd_db': psd_db
@@ -660,14 +829,51 @@ class MainWindow(QMainWindow):
         self.filter_high_label.setEnabled(is_band)
         self.filter_high_spin.setEnabled(is_band)
 
+    def on_filter_method_change(self, idx):
+        method = self.filter_method_combo.currentData()
+        is_fir = (method == 'fir')
+        self.iir_method_label.setEnabled(not is_fir)
+        self.iir_method_combo.setEnabled(not is_fir)
+        self.filter_window_combo.setEnabled(is_fir)
+        self.kaiser_beta_label.setEnabled(is_fir and self.filter_window_combo.currentData() == 'kaiser')
+        self.kaiser_beta_spin.setEnabled(is_fir and self.filter_window_combo.currentData() == 'kaiser')
+        self.on_iir_method_change(self.iir_method_combo.currentIndex())
+        if is_fir:
+            self.filter_order_spin.setRange(1, 1000)
+        else:
+            self.filter_order_spin.setRange(1, 20)
+
+    def on_iir_method_change(self, idx):
+        iir_method = self.iir_method_combo.currentData()
+        needs_passband = iir_method in ['cheby1', 'ellip']
+        needs_stopband = iir_method in ['cheby2', 'ellip']
+        self.passband_ripple_label.setEnabled(needs_passband)
+        self.passband_ripple_spin.setEnabled(needs_passband)
+        self.stopband_atten_label.setEnabled(needs_stopband)
+        self.stopband_atten_spin.setEnabled(needs_stopband)
+
+    def on_filter_window_change(self, idx):
+        is_kaiser = (self.filter_window_combo.currentData() == 'kaiser')
+        self.kaiser_beta_label.setEnabled(is_kaiser)
+        self.kaiser_beta_spin.setEnabled(is_kaiser)
+
+    def _on_filter_param_change(self, auto_preview=None):
+        if not hasattr(self, 'auto_preview_check'):
+            return
+        if auto_preview is None:
+            auto_preview = self.auto_preview_check.isChecked()
+        if auto_preview and self.auto_preview_check.isChecked():
+            self.preview_filter_response()
+
     def preview_filter_response(self):
         self._collect_filter_params()
         signal = self.get_active_signal()
         if signal is not None:
             self.filter_design.sample_rate = signal.sample_rate
+        self.filter_design.invalidate()
         success = self.filter_design.design()
         if not success:
-            QMessageBox.warning(self, '警告', '滤波器设计失败，请检查参数')
+            self.filter_info_label.setText('滤波器设计失败，请检查参数')
             return
         freqs, mag_db, phase_deg = self.filter_design.get_frequency_response()
         self.filter_response_plot.plot_response(
@@ -680,26 +886,38 @@ class MainWindow(QMainWindow):
             self.filter_response_plot.mark_cutoff(
                 self.filter_design.cutoff_low, self.filter_design.cutoff_high
             )
-        info = (
-            f"{FILTER_TYPE_NAMES[ft]} {self.filter_design.filter_method.upper()} 滤波器\n"
-            f"阶数: {self.filter_design.order}\n"
+        info_lines = []
+        info_lines.append(
+            f"{FILTER_TYPE_NAMES[ft]} {self.filter_design.get_method_description()}"
         )
+        info_lines.append(f"阶数: {self.filter_design.order}")
         if ft in ['lowpass', 'highpass']:
-            info += f"截止频率: {self.filter_design.cutoff_low:.1f} Hz"
+            info_lines.append(f"截止频率: {self.filter_design.cutoff_low:.1f} Hz")
         else:
-            info += (
+            info_lines.append(
                 f"通带: {self.filter_design.cutoff_low:.1f} - "
                 f"{self.filter_design.cutoff_high:.1f} Hz"
             )
-        self.filter_info_label.setText(info)
+        if self.filter_design.filter_method == 'iir':
+            if self.filter_design.iir_method in ['cheby1', 'ellip']:
+                info_lines.append(f"通带纹波: {self.filter_design.passband_ripple:.2f} dB")
+            if self.filter_design.iir_method in ['cheby2', 'ellip']:
+                info_lines.append(f"阻带衰减: {self.filter_design.stopband_attenuation:.1f} dB")
+        self.filter_info_label.setText('\n'.join(info_lines))
 
     def _collect_filter_params(self):
-        self.filter_design.filter_type = self.filter_type_combo.currentData()
-        self.filter_design.filter_method = self.filter_method_combo.currentData()
-        self.filter_design.order = self.filter_order_spin.value()
-        self.filter_design.cutoff_low = self.filter_low_spin.value()
-        self.filter_design.cutoff_high = self.filter_high_spin.value()
-        self.filter_design.window = self.filter_window_combo.currentData()
+        self.filter_design.set_params(
+            filter_type=self.filter_type_combo.currentData(),
+            filter_method=self.filter_method_combo.currentData(),
+            iir_method=self.iir_method_combo.currentData(),
+            order=self.filter_order_spin.value(),
+            cutoff_low=self.filter_low_spin.value(),
+            cutoff_high=self.filter_high_spin.value(),
+            passband_ripple=self.passband_ripple_spin.value(),
+            stopband_attenuation=self.stopband_atten_spin.value(),
+            window=self.filter_window_combo.currentData(),
+            kaiser_beta=self.kaiser_beta_spin.value()
+        )
 
     def apply_filter(self):
         signal = self.current_signal
@@ -708,13 +926,18 @@ class MainWindow(QMainWindow):
             return
         self._collect_filter_params()
         self.filter_design.sample_rate = signal.sample_rate
-        if not self.filter_design.is_valid():
-            success = self.filter_design.design()
-            if not success:
-                QMessageBox.warning(self, '警告', '滤波器设计失败')
-                return
+        self.filter_design.invalidate()
+        success = self.filter_design.ensure_design()
+        if not success:
+            QMessageBox.warning(self, '警告', '滤波器设计失败，请检查参数')
+            return
         self.filtered_signal = self.filter_design.apply_to_signal(signal)
         self.filter_compare_plot.plot_comparison(signal, self.filtered_signal)
+        if self.auto_preview_check.isChecked():
+            freqs, mag_db, phase_deg = self.filter_design.get_frequency_response()
+            self.filter_response_plot.plot_response(
+                freqs, mag_db, phase_deg, log_scale=True
+            )
         self.statusBar.showMessage('滤波完成')
 
     def compute_stft(self):

@@ -35,75 +35,188 @@ class BasePlotCanvas(QWidget):
 
 
 class TimeDomainPlot(BasePlotCanvas):
+    DISPLAY_MODE_OVERLAY = 'overlay'
+    DISPLAY_MODE_STACKED = 'stacked'
+    DISPLAY_MODE_SINGLE = 'single'
+
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.ax = None
-        self.span_selector = None
+        self.axes = []
+        self.span_selectors = []
         self.selection_callback = None
         self.current_signals = []
         self.current_times = None
+        self.current_channels = []
+        self.display_mode = self.DISPLAY_MODE_OVERLAY
+        self._xlim_callback = None
+        self._ylim_callback = None
         self._setup_axes()
 
-    def _setup_axes(self):
-        self.figure.clear()
-        self.ax = self.figure.add_subplot(111)
-        self.ax.set_xlabel('时间 (s)')
-        self.ax.set_ylabel('幅度')
-        self.ax.set_title('时域波形')
-        self.ax.grid(True, alpha=0.3)
-        self.span_selector = SpanSelector(
-            self.ax, self._on_select, 'horizontal',
-            useblit=True, props=dict(alpha=0.3, facecolor='red'),
-            interactive=True, drag_from_anywhere=True
-        )
-        self.canvas.draw_idle()
+    def set_display_mode(self, mode):
+        self.display_mode = mode
 
     def set_selection_callback(self, callback):
         self.selection_callback = callback
+
+    def set_xlim_changed_callback(self, callback):
+        self._xlim_callback = callback
+
+    def _on_xlim_changed(self, ax):
+        if self._xlim_callback:
+            xlim = ax.get_xlim()
+            self._xlim_callback(xlim[0], xlim[1])
+        for other_ax in self.axes:
+            if other_ax is not ax:
+                other_ax.set_xlim(ax.get_xlim())
 
     def _on_select(self, xmin, xmax):
         if self.selection_callback:
             self.selection_callback(xmin, xmax)
 
-    def plot_signal(self, audio_signal, channels=None, overlay=False):
+    def _setup_axes(self, n_axes=1, share_x=True):
+        self.figure.clear()
+        self.axes = []
+        self.span_selectors = []
+        for i in range(n_axes):
+            if i == 0 or not share_x:
+                ax = self.figure.add_subplot(n_axes, 1, i + 1)
+            else:
+                ax = self.figure.add_subplot(n_axes, 1, i + 1, sharex=self.axes[0])
+            ax.grid(True, alpha=0.3)
+            if n_axes > 1:
+                ax.set_ylabel(f'通道 {i + 1}')
+                if i < n_axes - 1:
+                    ax.tick_params(labelbottom=False)
+                if i == n_axes - 1:
+                    ax.set_xlabel('时间 (s)')
+            else:
+                ax.set_xlabel('时间 (s)')
+                ax.set_ylabel('幅度')
+                ax.set_title('时域波形')
+            ax.callbacks.connect('xlim_changed', self._on_xlim_changed)
+            span = SpanSelector(
+                ax, self._on_select, 'horizontal',
+                useblit=True, props=dict(alpha=0.3, facecolor='red'),
+                interactive=True, drag_from_anywhere=True
+            )
+            self.axes.append(ax)
+            self.span_selectors.append(span)
+        if n_axes == 1:
+            self.ax = self.axes[0]
+        self.figure.tight_layout()
+        self.canvas.draw_idle()
+
+    def _get_display_data(self, audio_signal, channel_idx, max_points=20000):
+        try:
+            display_data = audio_signal.get_display_data(max_points)
+            display_times = audio_signal.get_display_time_array(max_points)
+            if display_data is not None and display_times is not None:
+                if display_data.ndim == 2:
+                    return display_times, display_data[:, channel_idx]
+                else:
+                    return display_times, display_data
+        except Exception:
+            pass
+        times = audio_signal.get_time_array()
+        data = audio_signal.get_channel(channel_idx)
+        return times, data
+
+    def plot_signal(self, audio_signal, channels=None, overlay=False, display_mode=None):
         if audio_signal is None or audio_signal.data is None:
             return
-        if not overlay:
-            self._setup_axes()
-        times = audio_signal.get_time_array()
-        self.current_times = times
-        self.current_signals = []
+        if display_mode is not None:
+            self.display_mode = display_mode
         if channels is None:
             channels = list(range(audio_signal.channels))
-        for i, ch_idx in enumerate(channels):
-            ch_data = audio_signal.get_channel(ch_idx)
-            self.current_signals.append(ch_data)
-            label = f'通道 {ch_idx + 1}' if audio_signal.channels > 1 else '信号'
-            color = CHANNEL_COLORS[i % len(CHANNEL_COLORS)]
-            if overlay:
-                alpha = 0.6
-            else:
-                alpha = 1.0
-            self.ax.plot(times, ch_data, label=label, color=color, alpha=alpha, linewidth=0.5)
-        if len(channels) > 1 or overlay:
-            self.ax.legend(loc='upper right')
-        self.ax.set_xlim(times[0], times[-1])
-        self.ax.relim()
-        self.ax.autoscale_view()
+        self.current_channels = list(channels)
+        n_channels = len(channels)
+        if self.display_mode == self.DISPLAY_MODE_STACKED and n_channels > 1:
+            self._setup_axes(n_axes=n_channels, share_x=True)
+        else:
+            self._setup_axes(n_axes=1, share_x=True)
+        self.current_signals = []
+        if self.display_mode == self.DISPLAY_MODE_STACKED and n_channels > 1:
+            all_times = None
+            for i, ch_idx in enumerate(channels):
+                ax = self.axes[i]
+                times, ch_data = self._get_display_data(audio_signal, ch_idx)
+                self.current_signals.append(ch_data)
+                color = CHANNEL_COLORS[i % len(CHANNEL_COLORS)]
+                ax.plot(times, ch_data, color=color, linewidth=0.5)
+                ax.set_ylim(-1.05, 1.05) if np.max(np.abs(ch_data)) <= 1 else ax.relim()
+                ax.autoscale_view()
+                all_times = times
+            if all_times is not None:
+                for ax in self.axes:
+                    ax.set_xlim(all_times[0], all_times[-1])
+        else:
+            ax = self.axes[0]
+            all_times = None
+            for i, ch_idx in enumerate(channels):
+                times, ch_data = self._get_display_data(audio_signal, ch_idx)
+                self.current_signals.append(ch_data)
+                label = f'通道 {ch_idx + 1}' if audio_signal.channels > 1 else '信号'
+                color = CHANNEL_COLORS[i % len(CHANNEL_COLORS)]
+                alpha = 0.6 if overlay else 1.0
+                ax.plot(times, ch_data, label=label, color=color, alpha=alpha, linewidth=0.5)
+                all_times = times
+            if n_channels > 1 or overlay:
+                ax.legend(loc='upper right')
+            if all_times is not None:
+                ax.set_xlim(all_times[0], all_times[-1])
+            ax.relim()
+            ax.autoscale_view()
+        self.canvas.draw_idle()
+
+    def update_data_incremental(self, audio_signal, channels=None):
+        if audio_signal is None or audio_signal.data is None:
+            return
+        if len(self.axes) == 0:
+            self.plot_signal(audio_signal, channels)
+            return
+        if channels is None:
+            channels = self.current_channels if self.current_channels else list(range(audio_signal.channels))
+        if self.display_mode == self.DISPLAY_MODE_STACKED and len(channels) > 1 and len(self.axes) == len(channels):
+            for i, ch_idx in enumerate(channels):
+                ax = self.axes[i]
+                times, ch_data = self._get_display_data(audio_signal, ch_idx)
+                for line in ax.get_lines():
+                    line.remove()
+                color = CHANNEL_COLORS[i % len(CHANNEL_COLORS)]
+                ax.plot(times, ch_data, color=color, linewidth=0.5)
+                ax.set_xlim(times[0], times[-1])
+                ax.relim()
+                ax.autoscale_view()
+        else:
+            ax = self.axes[0]
+            for line in ax.get_lines():
+                line.remove()
+            for i, ch_idx in enumerate(channels):
+                times, ch_data = self._get_display_data(audio_signal, ch_idx)
+                label = f'通道 {ch_idx + 1}' if audio_signal.channels > 1 else '信号'
+                color = CHANNEL_COLORS[i % len(CHANNEL_COLORS)]
+                ax.plot(times, ch_data, label=label, color=color, linewidth=0.5)
+            ax.set_xlim(times[0], times[-1])
+            ax.relim()
+            ax.autoscale_view()
         self.canvas.draw_idle()
 
     def plot_comparison(self, signal_before, signal_after, channel_idx=0):
-        self._setup_axes()
+        self.display_mode = self.DISPLAY_MODE_OVERLAY
+        self._setup_axes(n_axes=1, share_x=True)
+        ax = self.axes[0]
         if signal_before is not None and signal_before.data is not None:
-            times1 = signal_before.get_time_array()
-            data1 = signal_before.get_channel(channel_idx)
-            self.ax.plot(times1, data1, label='滤波前', color='#1f77b4', alpha=0.7, linewidth=0.5)
+            times1, data1 = self._get_display_data(signal_before, channel_idx)
+            ax.plot(times1, data1, label='滤波前', color='#1f77b4', alpha=0.7, linewidth=0.5)
         if signal_after is not None and signal_after.data is not None:
-            times2 = signal_after.get_time_array()
-            data2 = signal_after.get_channel(channel_idx)
-            self.ax.plot(times2, data2, label='滤波后', color='#ff7f0e', alpha=0.7, linewidth=0.5)
-        self.ax.legend(loc='upper right')
-        self.ax.set_title('滤波前后对比')
+            times2, data2 = self._get_display_data(signal_after, channel_idx)
+            ax.plot(times2, data2, label='滤波后', color='#ff7f0e', alpha=0.7, linewidth=0.5)
+        ax.legend(loc='upper right')
+        ax.set_title('滤波前后对比')
+        ax.set_xlabel('时间 (s)')
+        ax.set_ylabel('幅度')
+        ax.relim()
+        ax.autoscale_view()
         self.canvas.draw_idle()
 
 
